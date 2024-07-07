@@ -1,4 +1,5 @@
 use anchor_lang::prelude::*;
+use std::collections::HashSet;
 
 declare_id!("5sFUqUTjAMJARrEafMX8f4J1LagdUQ9Y8TR8HwGNHkU8");
 
@@ -32,6 +33,8 @@ pub mod solquad {
         project_account.votes_count = 0;
         project_account.voter_amount = 0;
         project_account.distributed_amt = 0;
+        project_account.in_pool = false;
+        project_account.associated_pool = None;
 
         Ok(())
     }
@@ -39,16 +42,25 @@ pub mod solquad {
     pub fn add_project_to_pool(ctx: Context<AddProjectToPool>) -> Result<()> {
         let escrow_account = &mut ctx.accounts.escrow_account;
         let pool_account = &mut ctx.accounts.pool_account;
-        let project_account = &ctx.accounts.project_account;
+        let project_account = &mut ctx.accounts.project_account;
 
-        pool_account.projects.push(
-            project_account.project_owner
-        );
+        if project_account.in_pool {
+            return Err(ProgramError::InvalidInstructionData.into()); // Custom error code for already in a pool
+        }
+
+        if let Some(associated_pool) = project_account.associated_pool {
+            if associated_pool != pool_account.key() {
+                return Err(ProgramError::InvalidInstructionData.into()); // Custom error code for already associated with another pool
+            }
+        }
+
+        pool_account.projects.push(project_account.project_owner);
         pool_account.total_projects += 1;
 
-        escrow_account.project_reciever_addresses.push(
-            project_account.project_owner
-        );
+        escrow_account.project_reciever_addresses.push(project_account.project_owner);
+
+        project_account.in_pool = true;
+        project_account.associated_pool = Some(pool_account.key());
 
         Ok(())
     }
@@ -72,26 +84,42 @@ pub mod solquad {
     pub fn distribute_escrow_amount(ctx: Context<DistributeEscrowAmount>) -> Result<()> {
         let escrow_account = &mut ctx.accounts.escrow_account;
         let pool_account = &mut ctx.accounts.pool_account;
-        let project_account = &mut ctx.accounts.project_account;
-  
+
+        // Use a set to track processed projects
+        let mut processed_projects: HashSet<Pubkey> = HashSet::new();
+
         for i in 0..escrow_account.project_reciever_addresses.len() {
-            let distributable_amt: u64;
-            let votes: u64;
+            let project_key = escrow_account.project_reciever_addresses[i];
 
-            let project = pool_account.projects[i];
-            if project == project_account.project_owner {
-                votes = project_account.votes_count;
-            } else {
-                votes = 0;
+            // Skip already processed projects
+            if processed_projects.contains(&project_key) {
+                continue;
             }
 
-            if votes != 0 {
-                distributable_amt = (votes / pool_account.total_votes) * escrow_account.creator_deposit_amount as u64;
-            } else {
-                distributable_amt = 0;
+            // Find the project account
+            let mut project_account: Option<&mut Account<Project>> = None;
+            for proj in ctx.remaining_accounts.iter() {
+                if proj.key == project_key {
+                    project_account = Some(proj.try_borrow_mut_data().ok_or()?);
+                    break;
+                }
             }
+
+            let project_account = project_account.ok_or(ProgramError::InvalidInstructionData)?;
+
+            let votes = project_account.votes_count;
+
+            let distributable_amt = if votes != 0 {
+                let vote_ratio = votes.checked_div(pool_account.total_votes).ok_or(ProgramError::InvalidInstructionData)?;
+                vote_ratio.checked_mul(escrow_account.creator_deposit_amount).ok_or(ProgramError::InvalidInstructionData)?
+            } else {
+                0
+            };
 
             project_account.distributed_amt = distributable_amt;
+
+            // Mark the project as processed
+            processed_projects.insert(project_key);
         }
 
         Ok(())
@@ -133,7 +161,7 @@ pub struct InitializeProject<'info> {
     #[account(
         init,
         payer = project_owner,
-        space = 32 + 32 + 8 + 8 + 8 + 8,
+        space = 32 + 32 + 8 + 8 + 8 + 8 + 1 + 32, // Updated to include the boolean and associated_pool fields
         seeds = [b"project".as_ref(), pool_account.key().as_ref(), project_owner.key().as_ref()],
         bump,
     )]
@@ -202,6 +230,8 @@ pub struct Project {
     pub votes_count: u64,
     pub voter_amount: u64,
     pub distributed_amt: u64,
+    pub in_pool: bool, // Tracks if the project is already in a pool
+    pub associated_pool: Option<Pubkey>, // Tracks the associated pool
 }
 
 // Voters voting for the project
